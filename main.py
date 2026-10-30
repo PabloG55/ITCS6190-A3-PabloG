@@ -9,13 +9,31 @@ to <output>/clean_trips and one CSV result per part to <output>/part1, part2a, p
 Fill in the four functions marked TODO. Each returns a DataFrame; a function that still
 returns None is skipped, so the file runs after every step.
 """
+
 import sys
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (col, count, sum as ssum, avg, round as sround, to_date,
-                                   desc, row_number)
-from pyspark.sql.types import (StructType, StructField, StringType, IntegerType, DoubleType,
-                               TimestampType)
+from pyspark.sql.functions import (
+    col,
+    count,
+    sum as ssum,
+    avg,
+    round as sround,
+    to_date,
+    desc,
+    row_number,
+    desc,
+    row_number,
+    unix_timestamp,
+)
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    StringType,
+    IntegerType,
+    DoubleType,
+    TimestampType,
+)
 from pyspark.sql.window import Window
 
 if len(sys.argv) != 3:
@@ -33,24 +51,28 @@ def save(df, name, n=20):
         return
     print(f"\n=== {name} ===")
     df.show(n, truncate=False)
-    df.coalesce(1).write.mode("overwrite").option("header", True).csv(f"{out_dir}/{name}")
+    df.coalesce(1).write.mode("overwrite").option("header", True).csv(
+        f"{out_dir}/{name}"
+    )
 
 
 # ---------------------------------------------------------------- Load
 # The fare is read as a string on purpose: some rows carry an empty or non-numeric fare, and
 # a DOUBLE column would silently turn them into null at read time. Reading the text and
 # converting it yourself keeps the bad values visible and countable (part 1).
-trips_schema = StructType([
-    StructField("trip_id", StringType(), False),
-    StructField("driver_id", StringType(), False),
-    StructField("pickup_zone", IntegerType(), False),
-    StructField("dropoff_zone", IntegerType(), False),
-    StructField("pickup_ts", TimestampType(), False),
-    StructField("dropoff_ts", TimestampType(), False),
-    StructField("distance_km", DoubleType(), False),
-    StructField("fare", StringType(), True),
-    StructField("payment_type", StringType(), False),
-])
+trips_schema = StructType(
+    [
+        StructField("trip_id", StringType(), False),
+        StructField("driver_id", StringType(), False),
+        StructField("pickup_zone", IntegerType(), False),
+        StructField("dropoff_zone", IntegerType(), False),
+        StructField("pickup_ts", TimestampType(), False),
+        StructField("dropoff_ts", TimestampType(), False),
+        StructField("distance_km", DoubleType(), False),
+        StructField("fare", StringType(), True),
+        StructField("payment_type", StringType(), False),
+    ]
+)
 zones_schema = "zone_id INT, zone_name STRING, borough STRING"
 
 raw = spark.read.csv(f"{in_dir}/trips.csv", header=True, schema=trips_schema)
@@ -71,7 +93,32 @@ def part1_clean(raw):
     A row that breaks both rules counts in both bad_time and bad_fare, but once in removed.
     """
     # TODO
-    return None, None
+    bad = (
+        raw.withColumn("fare_num", col("fare").try_cast("double"))
+        .withColumn("bad_time", col("dropoff_ts") <= col("pickup_ts"))
+        .withColumn("bad_fare", col("fare_num").isNull())
+    )
+
+    counts = bad.agg(
+        count("*").alias("rows_total"),
+        ssum(col("bad_time").cast("int")).alias("bad_time"),
+        ssum(col("bad_fare").cast("int")).alias("bad_fare"),
+        ssum((col("bad_time") | col("bad_fare")).cast("int")).alias("removed"),
+    ).withColumn("rows_kept", col("rows_total") - col("removed"))
+
+    clean = (
+        bad.filter(~col("bad_time") & ~col("bad_fare"))
+        .withColumn("fare", col("fare_num"))
+        .withColumn("day", to_date(col("pickup_ts")))
+        .withColumn(
+            "duration_min",
+            (unix_timestamp(col("dropoff_ts")) - unix_timestamp(col("pickup_ts"))) / 60,
+        )
+        .drop("fare_num", "bad_time", "bad_fare")
+    )
+
+    clean.write.mode("overwrite").parquet(f"{out_dir}/clean_trips")
+    return clean, counts
 
 
 # ---------------------------------------------------------------- Part 2a: zone revenue per day
@@ -82,7 +129,15 @@ def part2a_zone_revenue(clean, zones):
     One row per (day, zone) with at least one trip. Ordered by day, then zone_id.
     """
     # TODO
-    return None
+    return (
+        clean.join(zones, clean.pickup_zone == zones.zone_id)
+        .groupBy("day", "zone_id", "zone_name")
+        .agg(
+            count("*").alias("trips"),
+            sround(ssum("fare"), 2).alias("revenue"),
+        )
+        .orderBy("day", "zone_id")
+    )
 
 
 # ---------------------------------------------------------------- Part 2b: driver busiest day
@@ -94,7 +149,16 @@ def part2b_driver_busiest_day(clean):
     partitioned by driver and ordered by trips descending, day ascending.
     """
     # TODO
-    return None
+    driver_per_day = clean.groupBy("driver_id", "day").agg(count("*").alias("trips"))
+
+    window = Window.partitionBy("driver_id").orderBy(desc("trips"), "day")
+
+    return (
+        driver_per_day.withColumn("rn", row_number().over(window))
+        .filter(col("rn") == 1)
+        .drop("rn")
+        .orderBy("driver_id")
+    )
 
 
 # ---------------------------------------------------------------- Part 3: Spark SQL
@@ -108,7 +172,18 @@ def part3_borough_sql(clean, zones):
     your report.
     """
     # TODO
-    return None
+    clean.createOrReplaceTempView("trips")
+    zones.createOrReplaceTempView("zones")
+    return spark.sql("""
+        SELECT z.borough,
+               COUNT(*)                     AS trips,
+               ROUND(SUM(t.fare), 2)        AS revenue,
+               ROUND(AVG(t.distance_km), 2) AS avg_distance_km
+        FROM trips t
+        JOIN zones z ON t.pickup_zone = z.zone_id
+        GROUP BY z.borough
+        ORDER BY revenue DESC
+    """)
 
 
 clean, counts = part1_clean(raw)
